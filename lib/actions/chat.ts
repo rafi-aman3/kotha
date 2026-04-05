@@ -98,22 +98,46 @@ export async function createGroupChat(name: string, memberIds: string[]) {
 }
 
 /**
- * Sends a message.
+ * Sends a message. Supports text and media attachments.
  */
-export async function sendMessage(conversationId: string, content: string) {
+export async function sendMessage(
+  conversationId: string, 
+  content: string,
+  fileData?: {
+    message_type?: string
+    file_url?: string
+    file_name?: string
+    file_size?: number
+    file_mime_type?: string
+  }
+) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   
   if (!user) return { error: 'Not authenticated' }
-  if (!content || content.trim() === '') return { error: 'Message cannot be empty' }
+  
+  const messageType = fileData?.message_type || 'text'
+  
+  // For text messages, content is required. For media, content is optional caption.
+  if (messageType === 'text' && (!content || content.trim() === '')) {
+    return { error: 'Message cannot be empty' }
+  }
+
+  const insertData: any = {
+    conversation_id: conversationId,
+    sender_id: user.id,
+    content: content?.trim() || null,
+    message_type: messageType,
+  }
+
+  if (fileData?.file_url) insertData.file_url = fileData.file_url
+  if (fileData?.file_name) insertData.file_name = fileData.file_name
+  if (fileData?.file_size) insertData.file_size = fileData.file_size
+  if (fileData?.file_mime_type) insertData.file_mime_type = fileData.file_mime_type
 
   const { data: message, error } = await supabase
     .from('messages')
-    .insert({
-      conversation_id: conversationId,
-      sender_id: user.id,
-      content: content.trim()
-    })
+    .insert(insertData)
     .select('*')
     .single()
 

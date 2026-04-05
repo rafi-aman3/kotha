@@ -5,9 +5,12 @@ import { createClient } from '@/lib/supabase/client'
 import { sendMessage, markAsRead } from '@/lib/actions/chat'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Button } from '@/components/ui/button'
-import { Check, CheckCheck, SendHorizontal, Loader2 } from 'lucide-react'
+import { SendHorizontal, Loader2 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
-import { format } from 'date-fns'
+import MessageBubble from './message-bubble'
+import { EmojiPicker } from './emoji-picker'
+import { MediaUploadButton } from './media-upload-button'
+import { VoiceRecorder } from './voice-recorder'
 
 export default function ChatBox({ conversation, initialMessages, currentUserId }: any) {
   const [messages, setMessages] = useState<any[]>(initialMessages || [])
@@ -19,6 +22,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   
   const scrollRef = useRef<HTMLDivElement>(null)
   const topSentinelRef = useRef<HTMLDivElement>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   
   const supabase = createClient()
@@ -32,6 +36,13 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   let displayAvatarUrl = null
   let fallbackPrefix = 'G'
   let highestOtherReadAt = 0
+  const isGroup = conversation.type === 'group'
+
+  // Build a participant profile map for group chats
+  const profileMap: Record<string, any> = {}
+  conversation.conversation_participants.forEach((p: any) => {
+    if (p.profiles) profileMap[p.user_id] = p.profiles
+  })
 
   otherParticipants.forEach((p: any) => {
     if (p && p.last_read_at) {
@@ -86,7 +97,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     }
   }, [conversation.id])
 
-  // Infinite scroll: load older messages when scrolling to top
+  // Infinite scroll
   useEffect(() => {
     if (!topSentinelRef.current) return
     const observer = new IntersectionObserver(
@@ -166,6 +177,11 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     }, 2000)
   }
 
+  function handleEmojiSelect(emoji: string) {
+    setInputText(prev => prev + emoji)
+    textareaRef.current?.focus()
+  }
+
   const typingUserIds = Object.keys(isTyping).filter(id => isTyping[id])
   const typingNames = typingUserIds.map(id => {
     const cp = otherParticipants.find((p: any) => p.user_id === id)
@@ -201,14 +217,13 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
       {/* Messages Area */}
       <div className="flex-1 overflow-hidden relative">
         <ScrollArea className="h-full w-full p-4">
-          <div className="flex flex-col gap-4 justify-end min-h-full pb-4">
+          <div className="flex flex-col gap-1 justify-end min-h-full pb-4">
             {messages.length === 0 ? (
               <div className="text-center text-muted-foreground my-auto pt-20 text-sm">
                 No messages yet. Say 👋 to start the conversation!
               </div>
             ) : (
               <>
-                {/* Sentinel for infinite scroll */}
                 <div ref={topSentinelRef} className="h-1" />
                 {loadingOlder && (
                   <div className="text-center py-3">
@@ -223,19 +238,15 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
                   const isSameSenderAsPrev = prevMsg && prevMsg.sender_id === msg.sender_id
 
                   return (
-                    <div key={msg.id || i} className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'}`}>
-                      <div className={`px-4 py-2 rounded-2xl text-[15px] leading-relaxed shadow-sm break-words
-                        ${isMe ? 'bg-indigo-600 text-white rounded-br-sm' : 'bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-bl-sm'}
-                      `}>
-                        <span className="whitespace-pre-wrap">{msg.content}</span>
-                        <div className={`flex items-center justify-end gap-1 mt-1 -mb-1 ${isMe ? 'text-indigo-200' : 'text-muted-foreground'}`}>
-                          <span className="text-[10px]">{format(new Date(msg.created_at), 'hh:mm a')}</span>
-                          {isMe && (
-                            isRead ? <CheckCheck className="w-3 h-3 text-blue-300" /> : <Check className="w-3 h-3" />
-                          )}
-                        </div>
-                      </div>
-                    </div>
+                    <MessageBubble
+                      key={msg.id || i}
+                      msg={msg}
+                      isMe={isMe}
+                      isRead={isRead}
+                      isSameSenderAsPrev={!!isSameSenderAsPrev}
+                      senderProfile={profileMap[msg.sender_id]}
+                      isGroup={isGroup}
+                    />
                   )
                 })}
               </>
@@ -256,9 +267,13 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
       </div>
 
       {/* Input Area */}
-      <div className="p-4 bg-white dark:bg-zinc-950 border-t shrink-0">
-        <div className="flex items-end gap-2 max-w-4xl mx-auto relative">
+      <div className="p-3 bg-white dark:bg-zinc-950 border-t shrink-0">
+        <div className="flex items-end gap-1.5 max-w-4xl mx-auto">
+          <EmojiPicker onSelect={handleEmojiSelect} />
+          <MediaUploadButton conversationId={conversation.id} />
+          <VoiceRecorder conversationId={conversation.id} />
           <textarea
+            ref={textareaRef}
             value={inputText}
             onChange={handleTyping}
             onKeyDown={handleKeyDown}
@@ -276,7 +291,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
             {isSending ? <Loader2 className="w-5 h-5 animate-spin" /> : <SendHorizontal className="w-5 h-5 ml-0.5" />}
           </Button>
         </div>
-        <div className="flex justify-between items-center text-[10px] text-muted-foreground mt-2 max-w-4xl mx-auto px-1">
+        <div className="flex justify-between items-center text-[10px] text-muted-foreground mt-1.5 max-w-4xl mx-auto px-1">
           <span><strong>Enter</strong> to send, <strong>Shift+Enter</strong> for newline</span>
           <span className={inputText.length >= 2000 ? 'text-red-500 font-medium' : ''}>{inputText.length}/2000</span>
         </div>
