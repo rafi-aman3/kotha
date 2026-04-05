@@ -2,8 +2,16 @@
 
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
+import { headers } from 'next/headers'
 import { createClient } from '@/lib/supabase/server'
 import { Provider } from '@supabase/supabase-js'
+
+async function getBaseUrl() {
+  const headersList = await headers()
+  const host = headersList.get('host') || 'localhost:3000'
+  const protocol = headersList.get('x-forwarded-proto') || 'http'
+  return `${protocol}://${host}`
+}
 
 export async function login(formData: FormData) {
   const supabase = await createClient()
@@ -52,7 +60,7 @@ export async function signup(formData: FormData) {
       data: {
         full_name: fullName,
       },
-      emailRedirectTo: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/auth/callback`,
+      emailRedirectTo: `${await getBaseUrl()}/auth/callback`,
     },
   })
 
@@ -69,7 +77,7 @@ export async function signInWithOAuth(provider: Provider) {
   const { data, error } = await supabase.auth.signInWithOAuth({
     provider: provider,
     options: {
-      redirectTo: `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/auth/callback`
+      redirectTo: `${await getBaseUrl()}/auth/callback`
     }
   })
 
