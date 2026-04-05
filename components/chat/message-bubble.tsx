@@ -4,11 +4,13 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { Check, CheckCheck, FileText, Download, Play, Pause } from 'lucide-react'
+import { Check, CheckCheck, FileText, Download, Play, Pause, Pin, Forward, Pencil } from 'lucide-react'
 import { format } from 'date-fns'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
-import { Button } from '@/components/ui/button'
 import { useState, useRef } from 'react'
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuSub, ContextMenuSubContent, ContextMenuSubTrigger, ContextMenuTrigger } from '@/components/ui/context-menu'
+import { editMessage, deleteMessage, togglePinMessage, toggleBookmark } from '@/lib/actions/chat'
+import { QuickReactionPicker, ReactionsDisplay } from './reaction-bar'
+import { toast } from 'sonner'
 
 interface MessageBubbleProps {
   msg: any
@@ -17,6 +19,13 @@ interface MessageBubbleProps {
   isSameSenderAsPrev: boolean
   senderProfile?: any
   isGroup?: boolean
+  currentUserId: string
+  reactions?: any[]
+  replyToMsg?: any
+  onReply?: (msg: any) => void
+  onForward?: (msg: any) => void
+  onJumpToMessage?: (msgId: string) => void
+  onRefresh?: () => void
 }
 
 function formatFileSize(bytes: number): string {
@@ -33,11 +42,7 @@ function AudioPlayer({ src }: { src: string }) {
 
   function togglePlay() {
     if (!audioRef.current) return
-    if (playing) {
-      audioRef.current.pause()
-    } else {
-      audioRef.current.play()
-    }
+    if (playing) { audioRef.current.pause() } else { audioRef.current.play() }
     setPlaying(!playing)
   }
 
@@ -46,17 +51,13 @@ function AudioPlayer({ src }: { src: string }) {
       <audio
         ref={audioRef}
         src={src}
-        onTimeUpdate={() => {
-          if (audioRef.current) setProgress((audioRef.current.currentTime / audioRef.current.duration) * 100)
-        }}
-        onLoadedMetadata={() => {
-          if (audioRef.current) setDuration(audioRef.current.duration)
-        }}
+        onTimeUpdate={() => { if (audioRef.current) setProgress((audioRef.current.currentTime / audioRef.current.duration) * 100) }}
+        onLoadedMetadata={() => { if (audioRef.current) setDuration(audioRef.current.duration) }}
         onEnded={() => { setPlaying(false); setProgress(0) }}
       />
-      <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 rounded-full" onClick={togglePlay}>
+      <button onClick={togglePlay} className="h-8 w-8 shrink-0 rounded-full flex items-center justify-center hover:bg-black/10 dark:hover:bg-white/10">
         {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-      </Button>
+      </button>
       <div className="flex-1 flex flex-col gap-1">
         <div className="h-1.5 bg-black/10 dark:bg-white/10 rounded-full overflow-hidden">
           <div className="h-full bg-current rounded-full transition-all" style={{ width: `${progress}%` }} />
@@ -69,49 +70,101 @@ function AudioPlayer({ src }: { src: string }) {
   )
 }
 
-export default function MessageBubble({ msg, isMe, isRead, isSameSenderAsPrev, senderProfile, isGroup }: MessageBubbleProps) {
+export default function MessageBubble({
+  msg, isMe, isRead, isSameSenderAsPrev, senderProfile, isGroup,
+  currentUserId, reactions, replyToMsg, onReply, onForward, onJumpToMessage, onRefresh
+}: MessageBubbleProps) {
+  const [editing, setEditing] = useState(false)
+  const [editText, setEditText] = useState(msg.content || '')
+  const [showReactions, setShowReactions] = useState(false)
+
   const messageType = msg.message_type || 'text'
 
+  // Handle deleted messages
+  if (msg.deleted_at) {
+    return (
+      <div className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'}`}>
+        <div className="px-4 py-2 rounded-2xl text-sm italic text-muted-foreground bg-zinc-100 dark:bg-zinc-900 border border-dashed">
+          🚫 This message was deleted
+        </div>
+      </div>
+    )
+  }
+
+  // Hidden for "delete for me"
+  if (msg.deleted_for?.includes(currentUserId)) return null
+
+  async function handleSaveEdit() {
+    if (!editText.trim()) return
+    const res = await editMessage(msg.id, editText)
+    if (res.error) toast.error(res.error)
+    else { setEditing(false); onRefresh?.() }
+  }
+
+  async function handleDelete(scope: 'me' | 'everyone') {
+    const res = await deleteMessage(msg.id, scope)
+    if (res.error) toast.error(res.error)
+    else { toast.success(scope === 'everyone' ? 'Deleted for everyone' : 'Deleted for you'); onRefresh?.() }
+  }
+
+  async function handlePin() {
+    const res = await togglePinMessage(msg.id)
+    if (res.error) toast.error(res.error)
+    else { toast.success(res.pinned ? 'Pinned' : 'Unpinned'); onRefresh?.() }
+  }
+
+  async function handleBookmark() {
+    const res = await toggleBookmark(msg.id)
+    if (res.error) toast.error(res.error)
+    else toast.success(res.bookmarked ? '⭐ Bookmarked' : 'Removed bookmark')
+  }
+
+  function handleCopy() {
+    navigator.clipboard.writeText(msg.content || '')
+    toast.success('Copied to clipboard')
+  }
+
   function renderContent() {
+    if (editing) {
+      return (
+        <div className="space-y-2">
+          <textarea
+            value={editText}
+            onChange={(e) => setEditText(e.target.value)}
+            className="w-full p-2 text-sm bg-transparent border rounded-lg resize-none min-h-[60px] focus:outline-none focus:ring-1 focus:ring-indigo-500"
+            autoFocus
+          />
+          <div className="flex gap-2 justify-end">
+            <button onClick={() => setEditing(false)} className="text-xs text-muted-foreground hover:text-foreground">Cancel</button>
+            <button onClick={handleSaveEdit} className="text-xs text-indigo-600 font-medium hover:text-indigo-700">Save</button>
+          </div>
+        </div>
+      )
+    }
+
     switch (messageType) {
       case 'image':
         return (
           <div className="space-y-1">
             <a href={msg.file_url} target="_blank" rel="noopener noreferrer">
-              <img
-                src={msg.file_url}
-                alt={msg.file_name || 'Image'}
-                className="max-w-full max-h-[300px] rounded-lg object-cover cursor-pointer hover:opacity-90 transition-opacity"
-              />
+              <img src={msg.file_url} alt={msg.file_name || 'Image'} className="max-w-full max-h-[300px] rounded-lg object-cover cursor-pointer hover:opacity-90 transition-opacity" />
             </a>
             {msg.content && <p className="text-sm whitespace-pre-wrap mt-1">{msg.content}</p>}
           </div>
         )
-
       case 'video':
         return (
           <div className="space-y-1">
-            <video
-              src={msg.file_url}
-              controls
-              className="max-w-full max-h-[300px] rounded-lg"
-              preload="metadata"
-            />
+            <video src={msg.file_url} controls className="max-w-full max-h-[300px] rounded-lg" preload="metadata" />
             {msg.content && <p className="text-sm whitespace-pre-wrap mt-1">{msg.content}</p>}
           </div>
         )
-
       case 'audio':
         return <AudioPlayer src={msg.file_url} />
-
       case 'file':
         return (
-          <a
-            href={msg.file_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className={`flex items-center gap-3 p-2 rounded-lg border ${isMe ? 'border-indigo-400/30 hover:bg-indigo-500/20' : 'border-zinc-200 dark:border-zinc-700 hover:bg-muted/50'} transition-colors`}
-          >
+          <a href={msg.file_url} target="_blank" rel="noopener noreferrer"
+            className={`flex items-center gap-3 p-2 rounded-lg border ${isMe ? 'border-indigo-400/30 hover:bg-indigo-500/20' : 'border-zinc-200 dark:border-zinc-700 hover:bg-muted/50'} transition-colors`}>
             <div className={`w-10 h-10 rounded-lg flex items-center justify-center shrink-0 ${isMe ? 'bg-indigo-400/20' : 'bg-zinc-100 dark:bg-zinc-800'}`}>
               <FileText className="w-5 h-5" />
             </div>
@@ -122,38 +175,23 @@ export default function MessageBubble({ msg, isMe, isRead, isSameSenderAsPrev, s
             <Download className="w-4 h-4 opacity-50 shrink-0" />
           </a>
         )
-
-      default: // 'text' — render as markdown
+      default:
         return (
           <ReactMarkdown
             remarkPlugins={[remarkGfm]}
             components={{
               p: ({ children }) => <span className="whitespace-pre-wrap">{children}</span>,
               a: ({ href, children }) => (
-                <a href={href} target="_blank" rel="noopener noreferrer" className={`underline ${isMe ? 'text-indigo-200 hover:text-white' : 'text-indigo-600 dark:text-indigo-400'}`}>
-                  {children}
-                </a>
+                <a href={href} target="_blank" rel="noopener noreferrer" className={`underline ${isMe ? 'text-indigo-200 hover:text-white' : 'text-indigo-600 dark:text-indigo-400'}`}>{children}</a>
               ),
               strong: ({ children }) => <strong className="font-bold">{children}</strong>,
               em: ({ children }) => <em className="italic">{children}</em>,
               del: ({ children }) => <del className="line-through opacity-70">{children}</del>,
-              code: ({ className, children, ...props }) => {
+              code: ({ className, children }) => {
                 const match = /language-(\w+)/.exec(className || '')
-                const isInline = !match
-                if (isInline) {
-                  return (
-                    <code className={`px-1.5 py-0.5 rounded text-xs font-mono ${isMe ? 'bg-indigo-500/30' : 'bg-zinc-200 dark:bg-zinc-800'}`}>
-                      {children}
-                    </code>
-                  )
-                }
+                if (!match) return <code className={`px-1.5 py-0.5 rounded text-xs font-mono ${isMe ? 'bg-indigo-500/30' : 'bg-zinc-200 dark:bg-zinc-800'}`}>{children}</code>
                 return (
-                  <SyntaxHighlighter
-                    style={oneDark}
-                    language={match[1]}
-                    PreTag="div"
-                    className="!rounded-lg !text-xs !my-2"
-                  >
+                  <SyntaxHighlighter style={oneDark} language={match[1]} PreTag="div" className="!rounded-lg !text-xs !my-2">
                     {String(children).replace(/\n$/, '')}
                   </SyntaxHighlighter>
                 )
@@ -166,26 +204,108 @@ export default function MessageBubble({ msg, isMe, isRead, isSameSenderAsPrev, s
     }
   }
 
-  return (
-    <div className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'}`}>
-      {/* Show sender name in group chats */}
+  const bubbleContent = (
+    <div
+      id={`msg-${msg.id}`}
+      className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'} group relative`}
+      onMouseEnter={() => setShowReactions(false)}
+    >
+      {/* Sender name in group */}
       {isGroup && !isMe && !isSameSenderAsPrev && senderProfile && (
-        <span className="text-[11px] font-medium text-indigo-600 dark:text-indigo-400 ml-1 mb-0.5">
-          {senderProfile.full_name}
+        <span className="text-[11px] font-medium text-indigo-600 dark:text-indigo-400 ml-1 mb-0.5">{senderProfile.full_name}</span>
+      )}
+
+      {/* Reply quote */}
+      {replyToMsg && (
+        <button
+          onClick={() => onJumpToMessage?.(replyToMsg.id)}
+          className={`text-left text-xs px-3 py-1.5 rounded-lg mb-0.5 border-l-2 border-indigo-400 truncate max-w-full
+            ${isMe ? 'bg-indigo-500/20 text-indigo-200' : 'bg-zinc-100 dark:bg-zinc-800 text-muted-foreground'}`}
+        >
+          {replyToMsg.content?.substring(0, 60) || '📎 Attachment'}
+        </button>
+      )}
+
+      {/* Forwarded label */}
+      {msg.forwarded_from_id && (
+        <span className={`text-[10px] flex items-center gap-1 ml-1 mb-0.5 ${isMe ? 'text-indigo-300' : 'text-muted-foreground'}`}>
+          <Forward className="w-3 h-3" /> Forwarded
         </span>
       )}
+
+      {/* Pin indicator */}
+      {msg.is_pinned && (
+        <span className={`text-[10px] flex items-center gap-1 ml-1 mb-0.5 ${isMe ? 'text-indigo-300' : 'text-muted-foreground'}`}>
+          <Pin className="w-3 h-3" /> Pinned
+        </span>
+      )}
+
       <div className={`px-4 py-2 rounded-2xl text-[15px] leading-relaxed shadow-sm break-words
         ${isMe ? 'bg-indigo-600 text-white rounded-br-sm' : 'bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-bl-sm'}
         ${messageType !== 'text' ? 'p-2' : ''}
       `}>
         {renderContent()}
         <div className={`flex items-center justify-end gap-1 mt-1 -mb-1 ${isMe ? 'text-indigo-200' : 'text-muted-foreground'}`}>
+          {msg.edited_at && <span className="text-[10px] italic mr-1">edited</span>}
           <span className="text-[10px]">{format(new Date(msg.created_at), 'hh:mm a')}</span>
-          {isMe && (
-            isRead ? <CheckCheck className="w-3 h-3 text-blue-300" /> : <Check className="w-3 h-3" />
-          )}
+          {isMe && (isRead ? <CheckCheck className="w-3 h-3 text-blue-300" /> : <Check className="w-3 h-3" />)}
         </div>
       </div>
+
+      {/* Reactions display */}
+      <ReactionsDisplay reactions={reactions || []} currentUserId={currentUserId} />
+
+      {/* Quick reaction on hover */}
+      {showReactions && (
+        <div className={`absolute ${isMe ? 'right-0' : 'left-0'} -top-8 z-20`}>
+          <QuickReactionPicker messageId={msg.id} onReacted={() => { setShowReactions(false); onRefresh?.() }} />
+        </div>
+      )}
     </div>
+  )
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild onPointerDown={() => setShowReactions(true)}>
+        {bubbleContent}
+      </ContextMenuTrigger>
+      <ContextMenuContent className="w-48">
+        <ContextMenuItem onClick={() => onReply?.(msg)}>
+          💬 Reply
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => setShowReactions(true)}>
+          😊 React
+        </ContextMenuItem>
+        <ContextMenuItem onClick={handleCopy}>
+          📋 Copy Text
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem onClick={handlePin}>
+          📌 {msg.is_pinned ? 'Unpin' : 'Pin'}
+        </ContextMenuItem>
+        <ContextMenuItem onClick={handleBookmark}>
+          ⭐ Star
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => onForward?.(msg)}>
+          ↗️ Forward
+        </ContextMenuItem>
+        {isMe && (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem onClick={() => { setEditing(true); setEditText(msg.content || '') }}>
+              ✏️ Edit
+            </ContextMenuItem>
+          </>
+        )}
+        <ContextMenuSeparator />
+        <ContextMenuSub>
+          <ContextMenuSubTrigger className="text-red-500">🗑 Delete</ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            <ContextMenuItem onClick={() => handleDelete('me')}>Delete for me</ContextMenuItem>
+            {isMe && <ContextMenuItem onClick={() => handleDelete('everyone')} className="text-red-500">Delete for everyone</ContextMenuItem>}
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+      </ContextMenuContent>
+    </ContextMenu>
   )
 }

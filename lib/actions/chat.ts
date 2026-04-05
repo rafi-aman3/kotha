@@ -109,6 +109,7 @@ export async function sendMessage(
     file_name?: string
     file_size?: number
     file_mime_type?: string
+    reply_to_id?: string
   }
 ) {
   const supabase = await createClient()
@@ -134,6 +135,7 @@ export async function sendMessage(
   if (fileData?.file_name) insertData.file_name = fileData.file_name
   if (fileData?.file_size) insertData.file_size = fileData.file_size
   if (fileData?.file_mime_type) insertData.file_mime_type = fileData.file_mime_type
+  if (fileData?.reply_to_id) insertData.reply_to_id = fileData.reply_to_id
 
   const { data: message, error } = await supabase
     .from('messages')
@@ -198,4 +200,186 @@ export async function searchUsers(query: string) {
 
   if (error) return { error: error.message }
   return { users: data || [] }
+}
+
+/**
+ * Edit a sent message (own only).
+ */
+export async function editMessage(messageId: string, newContent: string) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  const { error } = await supabase
+    .from('messages')
+    .update({ content: newContent.trim(), edited_at: new Date().toISOString() })
+    .eq('id', messageId)
+    .eq('sender_id', user.id)
+
+  if (error) return { error: error.message }
+  return { success: true }
+}
+
+/**
+ * Delete a message.
+ * scope: 'me' = hide for current user only, 'everyone' = soft delete for all
+ */
+export async function deleteMessage(messageId: string, scope: 'me' | 'everyone') {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  if (scope === 'everyone') {
+    const { error } = await supabase
+      .from('messages')
+      .update({ deleted_at: new Date().toISOString(), content: null })
+      .eq('id', messageId)
+      .eq('sender_id', user.id)
+    if (error) return { error: error.message }
+  } else {
+    // Add current user ID to deleted_for array
+    const { data: msg } = await supabase
+      .from('messages')
+      .select('deleted_for')
+      .eq('id', messageId)
+      .single()
+    
+    const currentArr = msg?.deleted_for || []
+    if (!currentArr.includes(user.id)) {
+      currentArr.push(user.id)
+    }
+    
+    const { error } = await supabase
+      .from('messages')
+      .update({ deleted_for: currentArr })
+      .eq('id', messageId)
+    if (error) return { error: error.message }
+  }
+
+  return { success: true }
+}
+
+/**
+ * React to a message with an emoji.
+ */
+export async function reactToMessage(messageId: string, emoji: string) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  // Toggle: if reaction exists, remove it; otherwise add it
+  const { data: existing } = await supabase
+    .from('message_reactions')
+    .select('id')
+    .eq('message_id', messageId)
+    .eq('user_id', user.id)
+    .eq('emoji', emoji)
+    .single()
+
+  if (existing) {
+    await supabase.from('message_reactions').delete().eq('id', existing.id)
+    return { action: 'removed' }
+  } else {
+    const { error } = await supabase
+      .from('message_reactions')
+      .insert({ message_id: messageId, user_id: user.id, emoji })
+    if (error) return { error: error.message }
+    return { action: 'added' }
+  }
+}
+
+/**
+ * Pin / unpin a message.
+ */
+export async function togglePinMessage(messageId: string) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  const { data: msg } = await supabase
+    .from('messages')
+    .select('is_pinned')
+    .eq('id', messageId)
+    .single()
+
+  if (!msg) return { error: 'Message not found' }
+
+  const { error } = await supabase
+    .from('messages')
+    .update({
+      is_pinned: !msg.is_pinned,
+      pinned_by: !msg.is_pinned ? user.id : null,
+      pinned_at: !msg.is_pinned ? new Date().toISOString() : null
+    })
+    .eq('id', messageId)
+
+  if (error) return { error: error.message }
+  return { pinned: !msg.is_pinned }
+}
+
+/**
+ * Bookmark / unbookmark a message.
+ */
+export async function toggleBookmark(messageId: string) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  const { data: existing } = await supabase
+    .from('message_bookmarks')
+    .select('id')
+    .eq('message_id', messageId)
+    .eq('user_id', user.id)
+    .single()
+
+  if (existing) {
+    await supabase.from('message_bookmarks').delete().eq('id', existing.id)
+    return { bookmarked: false }
+  } else {
+    const { error } = await supabase
+      .from('message_bookmarks')
+      .insert({ message_id: messageId, user_id: user.id })
+    if (error) return { error: error.message }
+    return { bookmarked: true }
+  }
+}
+
+/**
+ * Forward a message to another conversation.
+ */
+export async function forwardMessage(messageId: string, targetConversationId: string) {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) return { error: 'Not authenticated' }
+
+  const { data: original } = await supabase
+    .from('messages')
+    .select('*')
+    .eq('id', messageId)
+    .single()
+
+  if (!original) return { error: 'Message not found' }
+
+  const { error } = await supabase
+    .from('messages')
+    .insert({
+      conversation_id: targetConversationId,
+      sender_id: user.id,
+      content: original.content,
+      message_type: original.message_type || 'text',
+      file_url: original.file_url,
+      file_name: original.file_name,
+      file_size: original.file_size,
+      file_mime_type: original.file_mime_type,
+      forwarded_from_id: messageId
+    })
+
+  if (error) return { error: error.message }
+
+  await supabase
+    .from('conversations')
+    .update({ updated_at: new Date().toISOString() })
+    .eq('id', targetConversationId)
+
+  return { success: true }
 }

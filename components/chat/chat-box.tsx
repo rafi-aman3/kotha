@@ -11,6 +11,8 @@ import MessageBubble from './message-bubble'
 import { EmojiPicker } from './emoji-picker'
 import { MediaUploadButton } from './media-upload-button'
 import { VoiceRecorder } from './voice-recorder'
+import { ReplyPreview } from './reply-preview'
+import { ForwardDialog } from './forward-dialog'
 
 export default function ChatBox({ conversation, initialMessages, currentUserId }: any) {
   const [messages, setMessages] = useState<any[]>(initialMessages || [])
@@ -19,6 +21,9 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   const [isSending, setIsSending] = useState(false)
   const [loadingOlder, setLoadingOlder] = useState(false)
   const [hasMore, setHasMore] = useState(initialMessages?.length >= 50)
+  const [replyingTo, setReplyingTo] = useState<any>(null)
+  const [forwardMsg, setForwardMsg] = useState<any>(null)
+  const [reactions, setReactions] = useState<Record<string, any[]>>({})
   
   const scrollRef = useRef<HTMLDivElement>(null)
   const topSentinelRef = useRef<HTMLDivElement>(null)
@@ -28,7 +33,6 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   const supabase = createClient()
   const roomId = `room:${conversation.id}`
 
-  // Derive conversation details
   const otherParticipants = conversation.conversation_participants
     .filter((p: any) => p.user_id !== currentUserId)
     
@@ -38,7 +42,6 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   let highestOtherReadAt = 0
   const isGroup = conversation.type === 'group'
 
-  // Build a participant profile map for group chats
   const profileMap: Record<string, any> = {}
   conversation.conversation_participants.forEach((p: any) => {
     if (p.profiles) profileMap[p.user_id] = p.profiles
@@ -65,9 +68,29 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     }
   }, [])
 
-  useEffect(() => {
-    scrollToBottom()
-  }, [messages, isTyping, scrollToBottom])
+  useEffect(() => { scrollToBottom() }, [messages, isTyping, scrollToBottom])
+
+  // Fetch reactions for visible messages
+  async function fetchReactions() {
+    const msgIds = messages.map(m => m.id).filter(Boolean)
+    if (msgIds.length === 0) return
+
+    const { data } = await supabase
+      .from('message_reactions')
+      .select('*')
+      .in('message_id', msgIds)
+
+    if (data) {
+      const grouped: Record<string, any[]> = {}
+      data.forEach((r: any) => {
+        if (!grouped[r.message_id]) grouped[r.message_id] = []
+        grouped[r.message_id].push(r)
+      })
+      setReactions(grouped)
+    }
+  }
+
+  useEffect(() => { fetchReactions() }, [messages])
 
   useEffect(() => {
     markAsRead(conversation.id)
@@ -76,11 +99,25 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
       .channel(`db-messages-${conversation.id}`)
       .on(
         'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` },
+        { event: '*', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` },
         (payload) => {
-          setMessages((prev) => [...prev, payload.new])
+          if (payload.eventType === 'INSERT') {
+            setMessages(prev => [...prev, payload.new])
+          } else if (payload.eventType === 'UPDATE') {
+            setMessages(prev => prev.map(m => m.id === payload.new.id ? payload.new : m))
+          }
           markAsRead(conversation.id)
         }
+      )
+      .subscribe()
+
+    // Also listen for reaction changes
+    const reactionSync = supabase
+      .channel(`db-reactions-${conversation.id}`)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'message_reactions' },
+        () => { fetchReactions() }
       )
       .subscribe()
 
@@ -93,6 +130,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
 
     return () => {
       supabase.removeChannel(messageSync)
+      supabase.removeChannel(reactionSync)
       supabase.removeChannel(presenceChannel)
     }
   }, [conversation.id])
@@ -102,9 +140,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     if (!topSentinelRef.current) return
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0].isIntersecting && hasMore && !loadingOlder) {
-          loadOlderMessages()
-        }
+        if (entries[0].isIntersecting && hasMore && !loadingOlder) loadOlderMessages()
       },
       { threshold: 0.1 }
     )
@@ -115,7 +151,6 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   async function loadOlderMessages() {
     if (messages.length === 0 || loadingOlder) return
     setLoadingOlder(true)
-    
     const oldestMessage = messages[0]
     const { data } = await supabase
       .from('messages')
@@ -128,9 +163,7 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     if (data && data.length > 0) {
       setMessages(prev => [...data.reverse(), ...prev])
       if (data.length < 50) setHasMore(false)
-    } else {
-      setHasMore(false)
-    }
+    } else { setHasMore(false) }
     setLoadingOlder(false)
   }
 
@@ -141,39 +174,26 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     setIsSending(true)
     
     await supabase.channel(roomId).send({
-      type: 'broadcast',
-      event: 'typing',
+      type: 'broadcast', event: 'typing',
       payload: { userId: currentUserId, isTyping: false }
     })
 
-    await sendMessage(conversation.id, content)
+    await sendMessage(conversation.id, content, replyingTo ? { message_type: 'text', reply_to_id: replyingTo.id } : undefined)
+    setReplyingTo(null)
     setIsSending(false)
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
 
   function handleTyping(e: React.ChangeEvent<HTMLTextAreaElement>) {
     if (e.target.value.length > 2000) return
     setInputText(e.target.value)
-
-    supabase.channel(roomId).send({
-      type: 'broadcast',
-      event: 'typing',
-      payload: { userId: currentUserId, isTyping: true }
-    })
-
+    supabase.channel(roomId).send({ type: 'broadcast', event: 'typing', payload: { userId: currentUserId, isTyping: true } })
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
     typingTimeoutRef.current = setTimeout(() => {
-      supabase.channel(roomId).send({
-        type: 'broadcast',
-        event: 'typing',
-        payload: { userId: currentUserId, isTyping: false }
-      })
+      supabase.channel(roomId).send({ type: 'broadcast', event: 'typing', payload: { userId: currentUserId, isTyping: false } })
     }, 2000)
   }
 
@@ -182,12 +202,37 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     textareaRef.current?.focus()
   }
 
+  function handleJumpToMessage(msgId: string) {
+    const el = document.getElementById(`msg-${msgId}`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.add('ring-2', 'ring-indigo-400', 'rounded-2xl')
+      setTimeout(() => el.classList.remove('ring-2', 'ring-indigo-400', 'rounded-2xl'), 2000)
+    }
+  }
+
+  function handleRefreshMessages() {
+    // Refetch latest messages from DB
+    supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversation.id)
+      .order('created_at', { ascending: false })
+      .limit(50)
+      .then(({ data }) => {
+        if (data) setMessages(data.reverse())
+      })
+  }
+
+  // Build a map of reply targets
+  const replyMap: Record<string, any> = {}
+  messages.forEach(m => { replyMap[m.id] = m })
+
   const typingUserIds = Object.keys(isTyping).filter(id => isTyping[id])
   const typingNames = typingUserIds.map(id => {
     const cp = otherParticipants.find((p: any) => p.user_id === id)
     return cp ? (cp.profiles?.full_name || 'Someone') : 'Someone'
   })
-
   let typingText = ''
   if (typingNames.length === 1) typingText = `${typingNames[0]} is typing...`
   else if (typingNames.length > 1) typingText = `${typingNames.join(', ')} are typing...`
@@ -246,6 +291,13 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
                       isSameSenderAsPrev={!!isSameSenderAsPrev}
                       senderProfile={profileMap[msg.sender_id]}
                       isGroup={isGroup}
+                      currentUserId={currentUserId}
+                      reactions={reactions[msg.id] || []}
+                      replyToMsg={msg.reply_to_id ? replyMap[msg.reply_to_id] : null}
+                      onReply={(m) => { setReplyingTo(m); textareaRef.current?.focus() }}
+                      onForward={(m) => setForwardMsg(m)}
+                      onJumpToMessage={handleJumpToMessage}
+                      onRefresh={handleRefreshMessages}
                     />
                   )
                 })}
@@ -266,6 +318,9 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
         </ScrollArea>
       </div>
 
+      {/* Reply preview */}
+      {replyingTo && <ReplyPreview replyingTo={replyingTo} onCancel={() => setReplyingTo(null)} />}
+
       {/* Input Area */}
       <div className="p-3 bg-white dark:bg-zinc-950 border-t shrink-0">
         <div className="flex items-end gap-1.5 max-w-4xl mx-auto">
@@ -282,12 +337,8 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
             rows={1}
             maxLength={2000}
           />
-          <Button 
-            onClick={handleSend} 
-            disabled={!inputText.trim() || isSending}
-            size="icon"
-            className="rounded-full h-11 w-11 shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-transform active:scale-95"
-          >
+          <Button onClick={handleSend} disabled={!inputText.trim() || isSending} size="icon"
+            className="rounded-full h-11 w-11 shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition-transform active:scale-95">
             {isSending ? <Loader2 className="w-5 h-5 animate-spin" /> : <SendHorizontal className="w-5 h-5 ml-0.5" />}
           </Button>
         </div>
@@ -296,6 +347,14 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
           <span className={inputText.length >= 2000 ? 'text-red-500 font-medium' : ''}>{inputText.length}/2000</span>
         </div>
       </div>
+
+      {/* Forward dialog */}
+      <ForwardDialog
+        open={!!forwardMsg}
+        onOpenChange={(open) => { if (!open) setForwardMsg(null) }}
+        messageId={forwardMsg?.id || ''}
+        currentUserId={currentUserId}
+      />
     </div>
   )
 }
