@@ -144,22 +144,34 @@ export async function markAsRead(conversationId: string) {
 }
 
 /**
- * Search public users for new chats.
+ * Search users for new chats.
+ * Shows public profiles + conversation partners (via RLS).
+ * When no query, returns 5 suggested users.
  */
 export async function searchUsers(query: string) {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
   
-  if (!query || query.trim() === '') return { users: [] }
+  if (!query || query.trim() === '') {
+    // Show 5 suggested users when search is empty
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, username, full_name, avatar_url')
+      .neq('id', user?.id)
+      .order('created_at', { ascending: false })
+      .limit(5)
+
+    if (error) return { error: error.message }
+    return { users: data || [] }
+  }
 
   const { data, error } = await supabase
     .from('profiles')
     .select('id, username, full_name, avatar_url')
-    .eq('is_public', true)
     .neq('id', user?.id)
     .or(`username.ilike.%${query}%,full_name.ilike.%${query}%`)
     .limit(20)
 
   if (error) return { error: error.message }
-  return { users: data }
+  return { users: data || [] }
 }

@@ -27,22 +27,29 @@ export function ExploreDialog() {
 
   const router = useRouter()
 
+  // Load suggestions when dialog opens
   useEffect(() => {
-    const delayDebounceFn = setTimeout(async () => {
-      if (query.trim().length > 0) {
-        setLoading(true)
-        const { users, error } = await searchUsers(query)
-        if (!error && users) {
-          setResults(users)
-        }
-        setLoading(false)
-      } else {
-        setResults([])
-      }
+    if (open) {
+      loadUsers('')
+    }
+  }, [open])
+
+  useEffect(() => {
+    const delayDebounceFn = setTimeout(() => {
+      loadUsers(query)
     }, 500)
 
     return () => clearTimeout(delayDebounceFn)
   }, [query])
+
+  async function loadUsers(q: string) {
+    setLoading(true)
+    const { users, error } = await searchUsers(q)
+    if (!error && users) {
+      setResults(users)
+    }
+    setLoading(false)
+  }
 
   async function startDirectMessage(userId: string) {
     try {

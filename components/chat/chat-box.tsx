@@ -12,10 +12,13 @@ import { format } from 'date-fns'
 export default function ChatBox({ conversation, initialMessages, currentUserId }: any) {
   const [messages, setMessages] = useState<any[]>(initialMessages || [])
   const [inputText, setInputText] = useState('')
-  const [isTyping, setIsTyping] = useState<Record<string, boolean>>({}) // tracks who is typing
+  const [isTyping, setIsTyping] = useState<Record<string, boolean>>({})
   const [isSending, setIsSending] = useState(false)
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const [hasMore, setHasMore] = useState(initialMessages?.length >= 50)
   
   const scrollRef = useRef<HTMLDivElement>(null)
+  const topSentinelRef = useRef<HTMLDivElement>(null)
   const typingTimeoutRef = useRef<NodeJS.Timeout | null>(null)
   
   const supabase = createClient()
@@ -30,7 +33,6 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   let fallbackPrefix = 'G'
   let highestOtherReadAt = 0
 
-  // Calculate highest read timestamp from others to determine blue ticks
   otherParticipants.forEach((p: any) => {
     if (p && p.last_read_at) {
       const ts = new Date(p.last_read_at).getTime()
@@ -57,10 +59,8 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   }, [messages, isTyping, scrollToBottom])
 
   useEffect(() => {
-    // Re-mark as read continuously if we are active
     markAsRead(conversation.id)
 
-    // Setup Realtime Database Sync
     const messageSync = supabase
       .channel(`db-messages-${conversation.id}`)
       .on(
@@ -68,15 +68,12 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
         { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversation.id}` },
         (payload) => {
           setMessages((prev) => [...prev, payload.new])
-          // If we receive a message while looking at the screen, mark as read!
           markAsRead(conversation.id)
         }
       )
       .subscribe()
 
-    // Setup Presence for Typing Indicators
     const presenceChannel = supabase.channel(roomId)
-    
     presenceChannel
       .on('broadcast', { event: 'typing' }, (payload) => {
         setIsTyping(prev => ({ ...prev, [payload.payload.userId]: payload.payload.isTyping }))
@@ -89,13 +86,49 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     }
   }, [conversation.id])
 
+  // Infinite scroll: load older messages when scrolling to top
+  useEffect(() => {
+    if (!topSentinelRef.current) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasMore && !loadingOlder) {
+          loadOlderMessages()
+        }
+      },
+      { threshold: 0.1 }
+    )
+    observer.observe(topSentinelRef.current)
+    return () => observer.disconnect()
+  }, [hasMore, loadingOlder, messages])
+
+  async function loadOlderMessages() {
+    if (messages.length === 0 || loadingOlder) return
+    setLoadingOlder(true)
+    
+    const oldestMessage = messages[0]
+    const { data } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversation.id)
+      .lt('created_at', oldestMessage.created_at)
+      .order('created_at', { ascending: false })
+      .limit(50)
+
+    if (data && data.length > 0) {
+      setMessages(prev => [...data.reverse(), ...prev])
+      if (data.length < 50) setHasMore(false)
+    } else {
+      setHasMore(false)
+    }
+    setLoadingOlder(false)
+  }
+
   async function handleSend() {
     if (inputText.trim() === '' || isSending) return
     const content = inputText.trim()
-    setInputText('') // optimistic clearing
+    setInputText('')
     setIsSending(true)
     
-    // Broadcast stop typing
     await supabase.channel(roomId).send({
       type: 'broadcast',
       event: 'typing',
@@ -114,17 +147,15 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
   }
 
   function handleTyping(e: React.ChangeEvent<HTMLTextAreaElement>) {
-    if (e.target.value.length > 2000) return // Character limit enforcement
+    if (e.target.value.length > 2000) return
     setInputText(e.target.value)
 
-    // Broadcast typing event
     supabase.channel(roomId).send({
       type: 'broadcast',
       event: 'typing',
       payload: { userId: currentUserId, isTyping: true }
     })
 
-    // Auto-stop typing after 2 seconds
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current)
     typingTimeoutRef.current = setTimeout(() => {
       supabase.channel(roomId).send({
@@ -135,7 +166,6 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
     }, 2000)
   }
 
-  // Which users are typing right now?
   const typingUserIds = Object.keys(isTyping).filter(id => isTyping[id])
   const typingNames = typingUserIds.map(id => {
     const cp = otherParticipants.find((p: any) => p.user_id === id)
@@ -177,41 +207,48 @@ export default function ChatBox({ conversation, initialMessages, currentUserId }
                 No messages yet. Say 👋 to start the conversation!
               </div>
             ) : (
-            messages.map((msg: any, i: number) => {
-              const isMe = msg.sender_id === currentUserId
-              const msgTs = new Date(msg.created_at).getTime()
-              const isRead = msgTs <= highestOtherReadAt
-              
-              // Simple check if previous message was from same sender to group bubbles visually
-              const prevMsg = i > 0 ? messages[i-1] : null
-              const isSameSenderAsPrev = prevMsg && prevMsg.sender_id === msg.sender_id
+              <>
+                {/* Sentinel for infinite scroll */}
+                <div ref={topSentinelRef} className="h-1" />
+                {loadingOlder && (
+                  <div className="text-center py-3">
+                    <Loader2 className="w-4 h-4 animate-spin mx-auto text-muted-foreground" />
+                  </div>
+                )}
+                {messages.map((msg: any, i: number) => {
+                  const isMe = msg.sender_id === currentUserId
+                  const msgTs = new Date(msg.created_at).getTime()
+                  const isRead = msgTs <= highestOtherReadAt
+                  const prevMsg = i > 0 ? messages[i-1] : null
+                  const isSameSenderAsPrev = prevMsg && prevMsg.sender_id === msg.sender_id
 
-              return (
-                 <div key={msg.id || i} className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'}`}>
-                    <div className={`px-4 py-2 rounded-2xl text-[15px] leading-relaxed shadow-sm break-words
-                      ${isMe ? 'bg-indigo-600 text-white rounded-br-sm' : 'bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-bl-sm'}
-                    `}>
-                       <span className="whitespace-pre-wrap">{msg.content}</span>
-                       <div className={`flex items-center justify-end gap-1 mt-1 -mb-1 ${isMe ? 'text-indigo-200' : 'text-muted-foreground'}`}>
-                         <span className="text-[10px]">{format(new Date(msg.created_at), 'hh:mm a')}</span>
-                         {isMe && (
-                           isRead ? <CheckCheck className="w-3 h-3 text-blue-300" /> : <Check className="w-3 h-3" />
-                         )}
-                       </div>
+                  return (
+                    <div key={msg.id || i} className={`flex flex-col gap-1 w-fit max-w-[75%] ${isMe ? 'self-end' : 'self-start'} ${isSameSenderAsPrev ? 'mt-0' : 'mt-2'}`}>
+                      <div className={`px-4 py-2 rounded-2xl text-[15px] leading-relaxed shadow-sm break-words
+                        ${isMe ? 'bg-indigo-600 text-white rounded-br-sm' : 'bg-white dark:bg-zinc-900 border dark:border-zinc-800 rounded-bl-sm'}
+                      `}>
+                        <span className="whitespace-pre-wrap">{msg.content}</span>
+                        <div className={`flex items-center justify-end gap-1 mt-1 -mb-1 ${isMe ? 'text-indigo-200' : 'text-muted-foreground'}`}>
+                          <span className="text-[10px]">{format(new Date(msg.created_at), 'hh:mm a')}</span>
+                          {isMe && (
+                            isRead ? <CheckCheck className="w-3 h-3 text-blue-300" /> : <Check className="w-3 h-3" />
+                          )}
+                        </div>
+                      </div>
                     </div>
-                 </div>
-              )
-            })
-          )}
-          {typingText && (
-             <div className="self-start mt-2 px-4 py-2 bg-transparent text-muted-foreground text-xs animate-pulse flex items-center gap-1">
-               <span className="flex gap-1">
-                 <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                 <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                 <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-               </span>
-               <span className="ml-2">{typingText}</span>
-             </div>
+                  )
+                })}
+              </>
+            )}
+            {typingText && (
+              <div className="self-start mt-2 px-4 py-2 bg-transparent text-muted-foreground text-xs animate-pulse flex items-center gap-1">
+                <span className="flex gap-1">
+                  <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="w-1.5 h-1.5 bg-muted-foreground rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                </span>
+                <span className="ml-2">{typingText}</span>
+              </div>
             )}
             <div ref={scrollRef} className="h-1" />
           </div>

@@ -21,6 +21,7 @@ alter table profiles enable row level security;
 do $$ begin
   drop policy if exists "Public profiles are viewable by everyone." on profiles;
   drop policy if exists "Users can view their own profile." on profiles;
+  drop policy if exists "Users can view conversation partner profiles." on profiles;
   drop policy if exists "Users can insert their own profile." on profiles;
   drop policy if exists "Users can update own profile." on profiles;
   drop policy if exists "Users can delete own profile." on profiles;
@@ -31,6 +32,26 @@ create policy "Public profiles are viewable by everyone." on profiles
 
 create policy "Users can view their own profile." on profiles
   for select using (auth.uid() = id);
+
+-- Helper: get user IDs of people I share a conversation with
+create or replace function public.get_my_conversation_members()
+returns setof uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  return query
+    select distinct cp2.user_id
+    from conversation_participants cp1
+    join conversation_participants cp2 on cp1.conversation_id = cp2.conversation_id
+    where cp1.user_id = auth.uid() and cp2.user_id != auth.uid();
+end;
+$$;
+
+-- Chat partners can see each other's profile even if private
+create policy "Users can view conversation partner profiles." on profiles
+  for select using (id in (select public.get_my_conversation_members()));
 
 create policy "Users can insert their own profile." on profiles
   for insert with check (auth.uid() = id);
